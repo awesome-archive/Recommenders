@@ -1,561 +1,520 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""
-Reference implementation of SAR in python/numpy/pandas.
 
-This is not meant to be particularly performant or scalable, just
-as a simple and readable implementation.
-"""
 import numpy as np
 import pandas as pd
 import logging
 from scipy import sparse
 
-from reco_utils.common.constants import (
-    DEFAULT_USER_COL,
-    DEFAULT_ITEM_COL,
-    DEFAULT_RATING_COL,
-    DEFAULT_TIMESTAMP_COL,
-    PREDICTION_COL,
+from reco_utils.common.python_utils import (
+    jaccard,
+    lift,
+    exponential_decay,
+    get_top_k_scored_items,
 )
+from reco_utils.common import constants
 
-from reco_utils.recommender.sar import (
-    SIM_JACCARD,
-    SIM_LIFT,
-    SIM_COOCCUR,
-    HASHED_USERS,
-    HASHED_ITEMS,
-    _user_item_return_type,
-    _predict_column_type,
-)
-from reco_utils.recommender.sar import (
-    TIME_DECAY_COEFFICIENT,
-    TIME_NOW,
-    TIMEDECAY_FORMULA,
-    THRESHOLD,
-)
 
-"""
-enable or set manually with --log=INFO when running example file if you want logging:
-disabling because logging output contaminates stdout output on Databricsk Spark clusters
-"""
-# logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+COOCCUR = "cooccurrence"
+JACCARD = "jaccard"
+LIFT = "lift"
+
+logger = logging.getLogger()
 
 
 class SARSingleNode:
-    """SAR reference implementation"""
+    """Simple Algorithm for Recommendations (SAR) implementation
+
+    SAR is a fast scalable adaptive algorithm for personalized recommendations based on user transaction history
+    and items description. The core idea behind SAR is to recommend items like those that a user already has
+    demonstrated an affinity to. It does this by 1) estimating the affinity of users for items, 2) estimating
+    similarity across items, and then 3) combining the estimates to generate a set of recommendations for a given user.
+    """
 
     def __init__(
         self,
-        remove_seen=True,
-        col_user=DEFAULT_USER_COL,
-        col_item=DEFAULT_ITEM_COL,
-        col_rating=DEFAULT_RATING_COL,
-        col_timestamp=DEFAULT_TIMESTAMP_COL,
-        similarity_type=SIM_JACCARD,
-        time_decay_coefficient=TIME_DECAY_COEFFICIENT,
-        time_now=TIME_NOW,
-        timedecay_formula=TIMEDECAY_FORMULA,
-        threshold=THRESHOLD,
-        debug=False,
+        col_user=constants.DEFAULT_USER_COL,
+        col_item=constants.DEFAULT_ITEM_COL,
+        col_rating=constants.DEFAULT_RATING_COL,
+        col_timestamp=constants.DEFAULT_TIMESTAMP_COL,
+        col_prediction=constants.DEFAULT_PREDICTION_COL,
+        similarity_type=JACCARD,
+        time_decay_coefficient=30,
+        time_now=None,
+        timedecay_formula=False,
+        threshold=1,
+        normalize=False,
     ):
+        """Initialize model parameters
 
+        Args:
+            col_user (str): user column name
+            col_item (str): item column name
+            col_rating (str): rating column name
+            col_timestamp (str): timestamp column name
+            col_prediction (str): prediction column name
+            similarity_type (str): ['cooccurrence', 'jaccard', 'lift'] option for computing item-item similarity
+            time_decay_coefficient (float): number of days till ratings are decayed by 1/2
+            time_now (int | None): current time for time decay calculation
+            timedecay_formula (bool): flag to apply time decay
+            threshold (int): item-item co-occurrences below this threshold will be removed
+            normalize (bool): option for normalizing predictions to scale of original ratings
+        """
         self.col_rating = col_rating
         self.col_item = col_item
         self.col_user = col_user
-        # default values for all SAR algos
         self.col_timestamp = col_timestamp
+        self.col_prediction = col_prediction
 
-        self.remove_seen = remove_seen
-
-        # time of item-item similarity
+        if similarity_type not in [COOCCUR, JACCARD, LIFT]:
+            raise ValueError(
+                'Similarity type must be one of ["cooccurrence" | "jaccard" | "lift"]'
+            )
         self.similarity_type = similarity_type
-        # denominator in time decay. Zero makes time decay irrelevant
-        self.time_decay_coefficient = time_decay_coefficient
-        # toggle the computation of time decay group by formula
-        self.timedecay_formula = timedecay_formula
-        # current time for time decay calculation
+        self.time_decay_half_life = (
+            time_decay_coefficient * 24 * 60 * 60
+        )  # convert to seconds
+        self.time_decay_flag = timedecay_formula
         self.time_now = time_now
-        # cooccurrence matrix threshold
         self.threshold = threshold
-        # debug the code
-        self.debug = debug
-        # log the length of operations
-        self.timer_log = []
+        self.user_affinity = None
+        self.item_similarity = None
+        self.item_frequencies = None
 
-        # array of indexes for rows and columns of users and items in training set
-        self.index = None
-        self.model_str = "sar_ref"
-        self.model = self
+        # threshold - items below this number get set to zero in co-occurrence counts
+        if self.threshold <= 0:
+            raise ValueError("Threshold cannot be < 1")
 
-        # threshold - items below this number get set to zero in coocurrence counts
-        assert self.threshold > 0
+        # set flag to capture unity-rating user-affinity matrix for scaling scores
+        self.normalize = normalize
+        self.col_unity_rating = "_unity_rating"
+        self.unity_user_affinity = None
 
-        # more columns which are used internally
-        self._col_hashed_items = HASHED_ITEMS
-        self._col_hashed_users = HASHED_USERS
+        # column for mapping user / item ids to internal indices
+        self.col_item_id = "_indexed_items"
+        self.col_user_id = "_indexed_users"
 
-        # Obtain all the users and items from both training and test data
-        self.unique_users = None
-        self.unique_items = None
-        # store training set index for future use during prediction
-        self.index = None
+        # obtain all the users and items from both training and test data
+        self.n_users = None
+        self.n_items = None
 
-        # user2rowID map for prediction method to look up user affinity vectors
-        self.user_map_dict = None
         # mapping for item to matrix element
-        self.item_map_dict = None
+        self.user2index = None
+        self.item2index = None
 
         # the opposite of the above map - map array index to actual string ID
-        self.index2user = None
         self.index2item = None
 
-        # affinity scores for the recommendation
-        self.scores = None
+    def compute_affinity_matrix(self, df, rating_col):
+        """ Affinity matrix.
 
-    def set_index(
-        self,
-        unique_users,
-        unique_items,
-        user_map_dict,
-        item_map_dict,
-        index2user,
-        index2item,
-    ):
-        """MVP2 temporary function to set the index of the sparse dataframe.
-        In future releases this will be carried out into the data object and index will be provided
-        with the data"""
+        The user-affinity matrix can be constructed by treating the users and items as
+        indices in a sparse matrix, and the events as the data. Here, we're treating
+        the ratings as the event weights.  We convert between different sparse-matrix
+        formats to de-duplicate user-item pairs, otherwise they will get added up.
 
-        # original IDs of users and items in a list
-        # later as we modify the algorithm these might not be needed (can use dictionary keys
-        # instead)
-        self.unique_users = unique_users
-        self.unique_items = unique_items
-
-        # mapping of original IDs to actual matrix elements
-        self.user_map_dict = user_map_dict
-        self.item_map_dict = item_map_dict
-
-        # reverse mapping of matrix index to an item
-        # TODO: we can make this into an array as well
-        self.index2user = index2user
-        self.index2item = index2item
-
-    # private methods
-    @staticmethod
-    def __jaccard(cooccurrence):
-        """Helper method to calculate teh Jaccard cooccurrence of the item-item similarity"""
-        log.info("Calculating jaccard...")
-        diag = cooccurrence.diagonal()
-        diag_rows = np.expand_dims(diag, axis=0)
-        diag_cols = np.expand_dims(diag, axis=1)
-        # this essentially does vstack(diag_rows).T + vstack(diag_rows) - cooccurrence
-        denom = diag_rows + diag_cols - cooccurrence
-        return cooccurrence / denom
-
-    @staticmethod
-    def __lift(cooccurrence):
-        """Helper method to calculate the Lift of the item-item similarity"""
-        diag = cooccurrence.diagonal()
-        diag_rows = np.expand_dims(diag, axis=0)
-        diag_cols = np.expand_dims(diag, axis=1)
-        denom = diag_rows * diag_cols
-        return cooccurrence / denom
-
-    # stateful time function
-    def time(self):
-        """
-        Time a particular section of the code - call this once to set the state somewhere
-        in the code, then call it again to return the elapsed time since last call.
-        Call again to set the time and so on...
+        Args:
+            df (pd.DataFrame): Indexed df of users and items
+            rating_col (str): Name of column to use for ratings
 
         Returns:
-             None if we're not in debug mode - doesn't do anything
-             False if timer started
-             time in seconds since the last time time function was called
+            sparse.csr: Affinity matrix in Compressed Sparse Row (CSR) format.
         """
-        if self.debug:
-            if self.start_time is None:
-                self.start_time = time()
-                return False
-            else:
-                answer = time() - self.start_time
-                # reset state
-                self.start_time = None
-                return answer
-        else:
-            return None
 
-    def fit(self, df):
-        """Main fit method for SAR"""
+        return sparse.coo_matrix(
+            (df[rating_col], (df[self.col_user_id], df[self.col_item_id])),
+            shape=(self.n_users, self.n_items),
+        ).tocsr()
 
-        log.info("Collecting user affinity matrix...")
-        self.time()
-        if self.timedecay_formula:
-            # WARNING: previously we would take the last value in training dataframe and set it
-            # as a matrix U element
-            # for each user-item pair. Now with time decay, we compute a sum over ratings given
-            # by a user in the case
-            # when T=np.inf, so user gets a cumulative sum of ratings for a particular item and
-            # not the last rating.
-            log.info("Calculating time-decayed affinities...")
-            # Time Decay
-            # do a group by on user item pairs and apply the formula for time decay there
-            # Time T parameter is in days and input time is in seconds
-            # so we do dt/60/(T*24*60)=dt/(T*24*3600)
+    def compute_time_decay(self, df, decay_column):
+        """Compute time decay on provided column.
 
-            # if time_now is None - get the default behaviour
-            if not self.time_now:
-                self.time_now = df[self.col_timestamp].max()
+        Args:
+            df (pd.DataFrame): DataFrame of users and items
+            decay_column (str): column to decay
 
-            # optimization - pre-compute time decay exponential which multiplies the ratings
-            expo_fun = lambda x: np.exp(
-                -np.log(2.0)
-                * (self.time_now - x)
-                / (self.time_decay_coefficient * 24.0 * 3600)
-            )
-            df["exponential"] = expo_fun(df[self.col_timestamp].values)
+        Returns:
+            DataFrame: with column decayed
+        """
 
-            df["rating_exponential"] = df[self.col_rating] * df["exponential"]
+        # if time_now is None use the latest time
+        if self.time_now is None:
+            self.time_now = df[self.col_timestamp].max()
 
-            grouped = df.groupby([self.col_user, self.col_item])["rating_exponential"]
-
-            """
-            # experimental implementation of multiprocessing - in practice for smaller datasets this is not needed
-            # leaving here in case anyone wants to actually try this
-            # to enable, you need:
-            #   conda install dill>=0.2.8.1
-            #   pip install multiprocess>=0.70.6.1
-            # from multiprocess import Pool, cpu_count
-            # 
-            # multiproces uses dill for python3 to serialize lambda functions
-            #
-            # helper function to parallelize the operation on groups
-            def applyParallel(dfGrouped, func):
-                with Pool(cpu_count()*2) as p:
-                    ret_list = p.map(func, [group for name, group in dfGrouped])
-                return pd.concat(ret_list)
-
-            from types import MethodType
-            grouped.applyParallel = MethodType(applyParallel, grouped)
-
-            # then replace df.apply with df.applyParallel
-            """
-
-            """
-            Original implementatoin of groupby and apply - without optimization
-            rating_series = grouped.apply(lambda x: np.sum(np.array(x[self.col_rating]) * np.exp(
-                -np.log(2.) * (self.time_now - np.array(x[self.col_timestamp])) / (
-                    self.time_decay_coefficient * 24. * 3600))))
-            """
-
-            rating_series = grouped.sum()
-
-            # update df with the affinities after the timestamp calculation
-            df = rating_series.rename(self.col_rating).to_frame()
-            df.reset_index(inplace=True)
-        else:
-            # without time decay we take the last user-provided rating supplied in the dataset as the
-            # final rating for the user-item pair
-            log.info("Deduplicating the user-item counts")
-            df = df.drop_duplicates([self.col_user, self.col_item])[
-                [self.col_user, self.col_item, self.col_rating]
-            ]
-
-        if self.debug:
-            elapsed_time = self.time()
-            cnt = df.shape[0]
-            self.timer_log += [
-                "Affinity calculation:\t%d\trows in\t%s\tseconds -\t%f\trows per second."
-                % (cnt, elapsed_time, float(cnt) / elapsed_time)
-            ]
-
-        self.time()
-        log.info("Creating index columns...")
-        # Hash users and items according to the two dicts. Add the two new columns to df.
-        df.loc[:, self._col_hashed_items] = df[self.col_item].map(self.item_map_dict)
-        df.loc[:, self._col_hashed_users] = df[self.col_user].map(self.user_map_dict)
-
-        # store training set index for future use during prediction
-        # DO NOT USE .values as the warning message suggests
-        self.index = df.as_matrix([self._col_hashed_users, self._col_hashed_items])
-
-        n_items = len(self.unique_items)
-        n_users = len(self.unique_users)
-
-        # The user-affinity matrix can be constructed by treating the users and items as
-        # indices in a sparse matrix, and the events as the data. Here, we're treating
-        # the ratings as the event weights.  We convert between different sparse-matrix
-        # formats to de-duplicate user-item pairs, otherwise they will get added up.
-        log.info("Building user affinity sparse matrix...")
-        self.user_affinity = (
-            sparse.coo_matrix(
-                (
-                    df[self.col_rating],
-                    (df[self._col_hashed_users], df[self._col_hashed_items]),
-                ),
-                shape=(n_users, n_items),
-            )
-            .todok()
-            .tocsr()
+        # apply time decay to each rating
+        df[decay_column] *= exponential_decay(
+            value=df[self.col_timestamp],
+            max_val=self.time_now,
+            half_life=self.time_decay_half_life,
         )
 
-        if self.debug:
-            elapsed_time = self.time()
-            self.timer_log += [
-                "Indexing and affinity matrix construction:\t%d\trows in\t%s\tseconds -\t%f\trows per second."
-                % (cnt, elapsed_time, float(cnt) / elapsed_time)
-            ]
+        # group time decayed ratings by user-item and take the sum as the user-item affinity
+        return df.groupby([self.col_user, self.col_item]).sum().reset_index()
 
-        # Calculate item cooccurrence by computing:
-        #  C = U'.transpose() * U'
-        # where U' is the user_affinity matrix with 1's as values (instead of ratings)
-        log.info("Calculating item cooccurrence...")
-        self.time()
-        user_item_hits = (
-            sparse.coo_matrix(
-                (
-                    [1] * len(df[self._col_hashed_users]),
-                    (df[self._col_hashed_users], df[self._col_hashed_items]),
-                ),
-                shape=(n_users, n_items),
-            )
-            .todok()
-            .tocsr()
-        )
+    def compute_coocurrence_matrix(self, df):
+        """ Co-occurrence matrix.
 
-        fname = "user_item_hits.npz"
-        sparse.save_npz(fname, user_item_hits)
-        user_item_hits = sparse.load_npz(fname)
+        The co-occurrence matrix is defined as :math:`C = U^T * U`
+
+        where U is the user_affinity matrix with 1's as values (instead of ratings).
+
+        Args:
+            df (pd.DataFrame): DataFrame of users and items
+
+        Returns:
+            np.array: Co-occurrence matrix
+        """
+
+        user_item_hits = sparse.coo_matrix(
+            (np.repeat(1, df.shape[0]), (df[self.col_user_id], df[self.col_item_id])),
+            shape=(self.n_users, self.n_items),
+        ).tocsr()
 
         item_cooccurrence = user_item_hits.transpose().dot(user_item_hits)
-        if self.debug:
-            elapsed_time = self.time()
-            self.timer_log += [
-                "Item cooccurrence calculation:\t%d\trows in\t%s\tseconds -\t%f\trows per second."
-                % (cnt, elapsed_time, float(cnt) / elapsed_time)
-            ]
-
-        self.time()
         item_cooccurrence = item_cooccurrence.multiply(
             item_cooccurrence >= self.threshold
         )
-        if self.debug:
-            elapsed_time = self.time()
-            self.timer_log += [
-                "Applying threshold:\t%d\trows in\t%s\tseconds -\t%f\trows per second."
-                % (cnt, elapsed_time, float(cnt) / elapsed_time)
-            ]
 
-        log.info("Calculating item similarity...")
-        similarity_type = (
-            SIM_COOCCUR if self.similarity_type is None else self.similarity_type
-        )
+        return item_cooccurrence.astype(df[self.col_rating].dtype)
 
-        self.time()
-        if similarity_type == SIM_COOCCUR:
-            self.item_similarity = item_cooccurrence
-        elif similarity_type == SIM_JACCARD:
-            self.item_similarity = self.__jaccard(item_cooccurrence)
-        elif similarity_type == SIM_LIFT:
-            self.item_similarity = self.__lift(item_cooccurrence)
-        else:
-            raise ValueError("Unknown similarity type: {0}".format(similarity_type))
-
-        if self.debug and (
-            similarity_type == SIM_JACCARD or similarity_type == SIM_LIFT
-        ):
-            elapsed_time = self.time()
-            self.timer_log += [
-                "Item similarity calculation:\t%d\trows in\t%s\tseconds -\t%f\trows per second."
-                % (cnt, elapsed_time, float(cnt) / elapsed_time)
-            ]
-
-        # Calculate raw scores with a matrix multiplication.
-        log.info("Calculating recommendation scores...")
-        self.time()
-        self.scores = self.user_affinity.dot(self.item_similarity)
-
-        if self.debug:
-            elapsed_time = self.time()
-            self.timer_log += [
-                "Score calculation:\t%d\trows in\t%s\tseconds -\t%f\trows per second."
-                % (cnt, elapsed_time, float(cnt) / elapsed_time)
-            ]
-
-        log.info("done training")
-
-    def recommend_k_items(self, test, top_k=10, sort_top_k=False, **kwargs):
-        """Recommend top K items for all users which are in the test set
+    def set_index(self, df):
+        """Generate continuous indices for users and items to reduce memory usage.
 
         Args:
-            **kwargs:
-
-        Returns:
-            pd.DataFrame: A DataFrame that contains top k recommendation items for each user.
+            df (pd.DataFrame): dataframe with user and item ids
         """
 
-        # pick users from test set and
-        test_users = test[self.col_user].unique()
-        try:
-            test_users_training_ids = np.array(
-                [self.user_map_dict[user] for user in test_users]
-            )
-        except KeyError():
-            msg = "SAR cannot score test set users which are not in the training set"
-            log.error(msg)
-            raise ValueError(msg)
+        # generate a map of continuous index values to items
+        self.index2item = dict(enumerate(df[self.col_item].unique()))
 
-        # shorthand
-        scores = self.scores
+        # invert the mapping from above
+        self.item2index = {v: k for k, v in self.index2item.items()}
 
-        # Convert to dense, the following operations are easier.
-        log.info("Converting to dense matrix...")
-        if isinstance(scores, np.matrixlib.defmatrix.matrix):
-            scores_dense = np.array(scores)
+        # create mapping of users to continuous indices
+        self.user2index = {x[1]: x[0] for x in enumerate(df[self.col_user].unique())}
+
+        # set values for the total count of users and items
+        self.n_users = len(self.user2index)
+        self.n_items = len(self.index2item)
+
+    def fit(self, df):
+        """Main fit method for SAR.
+
+        Args:
+            df (pd.DataFrame): User item rating dataframe
+        """
+
+        # generate continuous indices if this hasn't been done
+        if self.index2item is None:
+            self.set_index(df)
+
+        logger.info("Collecting user affinity matrix")
+        if not np.issubdtype(df[self.col_rating].dtype, np.number):
+            raise TypeError("Rating column data type must be numeric")
+
+        # copy the DataFrame to avoid modification of the input
+        select_columns = [self.col_user, self.col_item, self.col_rating]
+        if self.time_decay_flag:
+            select_columns += [self.col_timestamp]
+        temp_df = df[select_columns].copy()
+
+        if self.time_decay_flag:
+            logger.info("Calculating time-decayed affinities")
+            temp_df = self.compute_time_decay(df=temp_df, decay_column=self.col_rating)
         else:
-            scores_dense = scores.todense()
+            # without time decay use the latest user-item rating in the dataset as the affinity score
+            logger.info("De-duplicating the user-item counts")
+            temp_df = temp_df.drop_duplicates(
+                [self.col_user, self.col_item], keep="last"
+            )
 
-        # take the intersection between train test items and items we actually need
-        test[self._col_hashed_users] = test[self.col_user].map(self.user_map_dict)
+        logger.info("Creating index columns")
+        # add mapping of user and item ids to indices
+        temp_df.loc[:, self.col_item_id] = temp_df[self.col_item].apply(
+            lambda item: self.item2index.get(item, np.NaN)
+        )
+        temp_df.loc[:, self.col_user_id] = temp_df[self.col_user].apply(
+            lambda user: self.user2index.get(user, np.NaN)
+        )
 
-        # Mask out items in the train set.  This only makes sense for some
-        # problems (where a user wouldn't interact with an item more than once).
-        if self.remove_seen:
-            log.info("Removing seen items...")
-            scores_dense[self.index[:, 0], self.index[:, 1]] = 0
+        if self.normalize:
+            logger.info("Calculating normalization factors")
+            temp_df[self.col_unity_rating] = 1.0
+            if self.time_decay_flag:
+                temp_df = self.compute_time_decay(
+                    df=temp_df, decay_column=self.col_unity_rating
+                )
+            self.unity_user_affinity = self.compute_affinity_matrix(
+                df=temp_df, rating_col=self.col_unity_rating
+            )
 
-        # Get top K items and scores.
-        log.info("Getting top K...")
-        top_items = np.argpartition(scores_dense, -top_k, axis=1)[:, -top_k:]
-        top_scores = scores_dense[np.arange(scores_dense.shape[0])[:, None], top_items]
+        # affinity matrix
+        logger.info("Building user affinity sparse matrix")
+        self.user_affinity = self.compute_affinity_matrix(
+            df=temp_df, rating_col=self.col_rating
+        )
 
-        log.info("Select users from the test set")
-        top_items = top_items[test_users_training_ids, :]
-        top_scores = top_scores[test_users_training_ids, :]
+        # calculate item co-occurrence
+        logger.info("Calculating item co-occurrence")
+        item_cooccurrence = self.compute_coocurrence_matrix(df=temp_df)
 
-        log.info("Creating output dataframe...")
+        # free up some space
+        del temp_df
 
-        # Convert to np.array (from view) and flatten
-        top_items = np.reshape(np.array(top_items), -1)
-        top_scores = np.reshape(np.array(top_scores), -1)
+        self.item_frequencies = item_cooccurrence.diagonal()
 
-        userids = []
-        for u in test_users:
-            userids.extend([u] * top_k)
+        logger.info("Calculating item similarity")
+        if self.similarity_type is COOCCUR:
+            logger.info("Using co-occurrence based similarity")
+            self.item_similarity = item_cooccurrence
+        elif self.similarity_type is JACCARD:
+            logger.info("Using jaccard based similarity")
+            self.item_similarity = jaccard(item_cooccurrence).astype(
+                df[self.col_rating].dtype
+            )
+        elif self.similarity_type is LIFT:
+            logger.info("Using lift based similarity")
+            self.item_similarity = lift(item_cooccurrence).astype(
+                df[self.col_rating].dtype
+            )
+        else:
+            raise ValueError("Unknown similarity type: {}".format(self.similarity_type))
 
-        results = pd.DataFrame.from_dict(
+        # free up some space
+        del item_cooccurrence
+
+        logger.info("Done training")
+
+    def score(self, test, remove_seen=False, normalize=False):
+        """Score all items for test users.
+
+        Args:
+            test (pd.DataFrame): user to test
+            remove_seen (bool): flag to remove items seen in training from recommendation
+            normalize (bool): flag to normalize scores to be in the same scale as the original ratings
+
+        Returns:
+            np.ndarray: Value of interest of all items for the users.
+        """
+
+        # get user / item indices from test set
+        user_ids = list(
+            map(
+                lambda user: self.user2index.get(user, np.NaN),
+                test[self.col_user].unique(),
+            )
+        )
+        if any(np.isnan(user_ids)):
+            raise ValueError("SAR cannot score users that are not in the training set")
+
+        # calculate raw scores with a matrix multiplication
+        logger.info("Calculating recommendation scores")
+        test_scores = self.user_affinity[user_ids, :].dot(self.item_similarity)
+
+        # ensure we're working with a dense ndarray
+        if isinstance(test_scores, sparse.spmatrix):
+            test_scores = test_scores.toarray()
+
+        # remove items in the train set so recommended items are always novel
+        if remove_seen:
+            logger.info("Removing seen items")
+            test_scores += self.user_affinity[user_ids, :] * -np.inf
+
+        if normalize:
+            if self.unity_user_affinity is None:
+                raise ValueError(
+                    "Cannot use normalize flag during scoring if it was not set at model instantiation"
+                )
+            else:
+                test_scores = np.array(
+                    np.divide(
+                        test_scores,
+                        self.unity_user_affinity[user_ids, :].dot(self.item_similarity),
+                    )
+                )
+                test_scores = np.where(np.isnan(test_scores), -np.inf, test_scores)
+
+        return test_scores
+
+    def get_popularity_based_topk(self, top_k=10, sort_top_k=True):
+        """Get top K most frequently occurring items across all users.
+
+        Args:
+            top_k (int): number of top items to recommend.
+            sort_top_k (bool): flag to sort top k results.
+
+        Returns:
+            pd.DataFrame: top k most popular items.
+        """
+
+        test_scores = np.array([self.item_frequencies])
+
+        logger.info("Getting top K")
+        top_items, top_scores = get_top_k_scored_items(
+            scores=test_scores, top_k=top_k, sort_top_k=sort_top_k
+        )
+
+        return pd.DataFrame(
             {
-                self.col_user: userids,
-                self.col_item: top_items,
-                self.col_rating: top_scores,
+                self.col_item: [self.index2item[item] for item in top_items.flatten()],
+                self.col_prediction: top_scores.flatten(),
             }
         )
 
-        # remap user and item indices to IDs
-        results[self.col_item] = results[self.col_item].map(self.index2item)
+    def get_item_based_topk(self, items, top_k=10, sort_top_k=True):
+        """Get top K similar items to provided seed items based on similarity metric defined.
+        This method will take a set of items and use them to recommend the most similar items to that set
+        based on the similarity matrix fit during training.
+        This allows recommendations for cold-users (unseen during training), note - the model is not updated.
 
-        # do final sort
-        if sort_top_k:
-            results = (
-                results.sort_values(
-                    by=[self.col_user, self.col_rating], ascending=False
+        The following options are possible based on information provided in the items input:
+        1. Single user or seed of items: only item column (ratings are assumed to be 1)
+        2. Single user or seed of items w/ ratings: item column and rating column
+        3. Separate users or seeds of items: item and user column (user ids are only used to separate item sets)
+        4. Separate users or seeds of items with ratings: item, user and rating columns provided
+
+        Args:
+            items (pd.DataFrame): DataFrame with item, user (optional), and rating (optional) columns
+            top_k (int): number of top items to recommend
+            sort_top_k (bool): flag to sort top k results
+
+        Returns:
+            pd.DataFrame: sorted top k recommendation items
+        """
+
+        # convert item ids to indices
+        item_ids = np.asarray(
+            list(
+                map(
+                    lambda item: self.item2index.get(item, np.NaN),
+                    items[self.col_item].values,
                 )
-                .groupby(self.col_user)
-                .apply(lambda x: x)
-            )
-
-        # format the dataframe in the end to conform to Suprise return type
-        log.info("Formatting output")
-
-        # modify test to make it compatible with
-
-        return (
-            results[[self.col_user, self.col_item, self.col_rating]]
-            .rename(columns={self.col_rating: PREDICTION_COL})
-            .astype(
-                {
-                    self.col_user: _user_item_return_type(),
-                    self.col_item: _user_item_return_type(),
-                    PREDICTION_COL: _predict_column_type(),
-                }
             )
         )
+
+        # if no ratings were provided assume they are all 1
+        if self.col_rating in items.columns:
+            ratings = items[self.col_rating]
+        else:
+            ratings = pd.Series(np.ones_like(item_ids))
+
+        # create local map of user ids
+        if self.col_user in items.columns:
+            test_users = items[self.col_user]
+            user2index = {x[1]: x[0] for x in enumerate(items[self.col_user].unique())}
+            user_ids = test_users.map(user2index)
+        else:
+            # if no user column exists assume all entries are for a single user
+            test_users = pd.Series(np.zeros_like(item_ids))
+            user_ids = test_users
+        n_users = user_ids.drop_duplicates().shape[0]
+
+        # generate pseudo user affinity using seed items
+        pseudo_affinity = sparse.coo_matrix(
+            (ratings, (user_ids, item_ids)), shape=(n_users, self.n_items)
+        ).tocsr()
+
+        # calculate raw scores with a matrix multiplication
+        test_scores = pseudo_affinity.dot(self.item_similarity)
+
+        # remove items in the seed set so recommended items are novel
+        test_scores[user_ids, item_ids] = -np.inf
+
+        top_items, top_scores = get_top_k_scored_items(
+            scores=test_scores, top_k=top_k, sort_top_k=sort_top_k
+        )
+
+        df = pd.DataFrame(
+            {
+                self.col_user: np.repeat(
+                    test_users.drop_duplicates().values, top_items.shape[1]
+                ),
+                self.col_item: [self.index2item[item] for item in top_items.flatten()],
+                self.col_prediction: top_scores.flatten(),
+            }
+        )
+
+        # drop invalid items
+        return df.replace(-np.inf, np.nan).dropna()
+
+    def recommend_k_items(
+        self, test, top_k=10, sort_top_k=True, remove_seen=False, normalize=False
+    ):
+        """Recommend top K items for all users which are in the test set
+
+        Args:
+            test (pd.DataFrame): users to test
+            top_k (int): number of top items to recommend
+            sort_top_k (bool): flag to sort top k results
+            remove_seen (bool): flag to remove items seen in training from recommendation
+
+        Returns:
+            pd.DataFrame: top k recommendation items for each user
+        """
+
+        test_scores = self.score(test, remove_seen=remove_seen, normalize=normalize)
+
+        top_items, top_scores = get_top_k_scored_items(
+            scores=test_scores, top_k=top_k, sort_top_k=sort_top_k
+        )
+
+        df = pd.DataFrame(
+            {
+                self.col_user: np.repeat(
+                    test[self.col_user].drop_duplicates().values, top_items.shape[1]
+                ),
+                self.col_item: [self.index2item[item] for item in top_items.flatten()],
+                self.col_prediction: top_scores.flatten(),
+            }
+        )
+
+        # drop invalid items
+        return df.replace(-np.inf, np.nan).dropna()
 
     def predict(self, test):
         """Output SAR scores for only the users-items pairs which are in the test set
 
         Args:
-            test (pd.DataFrame): DataFrame that contains ground-truth of user-item ratings.
+            test (pd.DataFrame): DataFrame that contains users and items to test
 
-        Return:
-            pd.DataFrame: DataFrame contains the prediction results.
+        Returns:
+            pd.DataFrame: DataFrame contains the prediction results
         """
-        # pick users from test set and
-        test_users = test[self.col_user].unique()
-        try:
-            training_ids = np.array([self.user_map_dict[user] for user in test_users])
-            assert training_ids is not None
-        except KeyError():
-            msg = "SAR cannot score test set users which are not in the training set"
-            log.error(msg)
-            raise ValueError(msg)
 
-        # shorthand
-        scores = self.scores
-
-        # Convert to dense, the following operations are easier.
-        log.info("Converting to dense matrix...")
-        if isinstance(scores, np.matrixlib.defmatrix.matrix):
-            scores_dense = np.array(scores)
-        else:
-            scores_dense = scores.todense()
-
-        # take the intersection between train test items and items we actually need
-        test[self._col_hashed_users] = test[self.col_user].map(self.user_map_dict)
-        test[self._col_hashed_items] = test[self.col_item].map(self.item_map_dict)
-
-        test_index = test.as_matrix([self._col_hashed_users, self._col_hashed_items])
-        aset = set([tuple(x) for x in self.index])
-        bset = set([tuple(x) for x in test_index])
-
-        common_index = np.array([x for x in aset & bset])
-
-        # Mask out items in the train set.  This only makes sense for some
-        # problems (where a user wouldn't interact with an item more than once).
-        if self.remove_seen and len(aset & bset) > 0:
-            log.info("Removing seen items...")
-            scores_dense[common_index[:, 0], common_index[:, 1]] = 0
-
-        final_scores = scores_dense[test_index[:, 0], test_index[:, 1]]
-
-        results = pd.DataFrame.from_dict(
-            {
-                self.col_user: test_index[:, 0],
-                self.col_item: test_index[:, 1],
-                self.col_rating: final_scores,
-            }
-        )
-
-        # remap user and item indices to IDs
-        results[self.col_user] = results[self.col_user].map(self.index2user)
-        results[self.col_item] = results[self.col_item].map(self.index2item)
-
-        # format the dataframe in the end to conform to Suprise return type
-        log.info("Formatting output")
-
-        # modify test to make it compatible with
-        return (
-            results[[self.col_user, self.col_item, self.col_rating]]
-            .rename(columns={self.col_rating: PREDICTION_COL})
-            .astype(
-                {
-                    self.col_user: _user_item_return_type(),
-                    self.col_item: _user_item_return_type(),
-                    PREDICTION_COL: _predict_column_type(),
-                }
+        test_scores = self.score(test)
+        user_ids = np.asarray(
+            list(
+                map(
+                    lambda user: self.user2index.get(user, np.NaN),
+                    test[self.col_user].values,
+                )
             )
         )
 
+        # create mapping of new items to zeros
+        item_ids = np.asarray(
+            list(
+                map(
+                    lambda item: self.item2index.get(item, np.NaN),
+                    test[self.col_item].values,
+                )
+            )
+        )
+        nans = np.isnan(item_ids)
+        if any(nans):
+            logger.warning(
+                "Items found in test not seen during training, new items will have score of 0"
+            )
+            test_scores = np.append(test_scores, np.zeros((self.n_users, 1)), axis=1)
+            item_ids[nans] = self.n_items
+            item_ids = item_ids.astype("int64")
+
+        df = pd.DataFrame(
+            {
+                self.col_user: test[self.col_user].values,
+                self.col_item: test[self.col_item].values,
+                self.col_prediction: test_scores[user_ids, item_ids],
+            }
+        )
+        return df
